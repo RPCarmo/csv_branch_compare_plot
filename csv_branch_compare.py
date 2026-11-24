@@ -25,6 +25,10 @@ Tick "Use current working tree" to compare the uncommitted files on disk (includ
 untracked CSVs) instead of a branch; "before" is then HEAD unless "Base" is filled in,
 and nothing is fetched.
 
+"Summary (all files)" lists, for each changed file, how much its numbers changed (mean
+and maximum difference, as a percentage of each column's size); double-click a file
+there to see the same numbers per column.
+
 Requires: git on PATH, Python 3.10+, pandas, matplotlib (Tkinter ships with Python)
 """
 import io
@@ -298,12 +302,232 @@ def as_plottable(series):
     return series.astype(str)
 
 
+def read_pair(comparison: Comparison, repo_root: str, status: str, old: str, new: str):
+    """Return the (before, after) DataFrames of a changed file (None where it does not exist)."""
+    before = None if status == "A" else read_csv(read_version(comparison.base_rev, old, repo_root))
+    after = None if status == "D" else read_csv(read_version(comparison.head_rev, new, repo_root))
+    return before, after
+
+
+@dataclass(frozen=True)
+class ColumnChange:
+    """How much one numeric column changed between 'before' and 'after'."""
+
+    column: str
+    mean_difference: float
+    """Mean of |after - before|, in the column's own unit."""
+    max_difference: float
+    mean_percent: float
+    """Mean difference as a percentage of the column's size (its largest absolute value)."""
+    max_percent: float
+
+
+def column_changes(before: pd.DataFrame, after: pd.DataFrame) -> list[ColumnChange]:
+    """
+    Compare the numeric columns present on both sides, row by row.
+
+    Percentages are relative to each column's largest absolute value, so values close to
+    zero do not blow them up. Only the rows present on both sides are compared.
+    """
+    row_count = min(len(before), len(after))
+    changes = []
+    for column in after.columns:
+        if column not in before.columns:
+            continue
+        old = pd.to_numeric(before[column].iloc[:row_count], errors="coerce")
+        new = pd.to_numeric(after[column].iloc[:row_count], errors="coerce")
+        valid = old.notna() & new.notna()
+        if not valid.any():
+            # Keep columns that are numeric but empty on a side, so their values can be
+            # inspected; skip text columns.
+            both_empty = before[column].iloc[:row_count].isna().all() and after[column].iloc[:row_count].isna().all()
+            if old.notna().any() or new.notna().any() or both_empty:
+                nan = float("nan")
+                changes.append(ColumnChange(str(column), nan, nan, nan, nan))
+            continue
+        difference = (new[valid] - old[valid]).abs()
+        size = max(old[valid].abs().max(), new[valid].abs().max())
+        scale = 100.0 / size if size > 0 else 0.0
+        changes.append(ColumnChange(
+            column=str(column),
+            mean_difference=float(difference.mean()),
+            max_difference=float(difference.max()),
+            mean_percent=float(difference.mean() * scale),
+            max_percent=float(difference.max() * scale),
+        ))
+    return changes
+
+
+@dataclass(frozen=True)
+class FileChange:
+    """Summary of how much one CSV file changed (one line of the summary table)."""
+
+    label: str
+    status: str
+    old: str
+    new: str
+    rows_before: int | None
+    rows_after: int | None
+    changed_columns: int
+    numeric_columns: int
+    mean_percent: float | None
+    """Mean of the per-column mean percentages, over the columns that changed."""
+    max_percent: float | None
+    worst_column: str
+    columns: list[ColumnChange]
+
+    @classmethod
+    def FromFrames(cls, status: str, old: str, new: str,
+                   before: pd.DataFrame | None, after: pd.DataFrame | None) -> "FileChange":
+        """Summarize a file; added or deleted files have no numbers to compare."""
+        label = file_label(status, old, new)
+        rows_before = None if before is None else len(before)
+        rows_after = None if after is None else len(after)
+        if before is None or after is None:
+            return cls(label, status, old, new, rows_before, rows_after, 0, 0, None, None, "", [])
+        columns = column_changes(before, after)
+        changed = [c for c in columns if c.max_difference > 0]
+        if not changed:
+            return cls(label, status, old, new, rows_before, rows_after, 0, len(columns), 0.0, 0.0, "", columns)
+        worst = max(changed, key=lambda c: c.max_percent)
+        return cls(
+            label, status, old, new, rows_before, rows_after, len(changed), len(columns),
+            sum(c.mean_percent for c in changed) / len(changed), worst.max_percent, worst.column, columns,
+        )
+
+
+# --------------------------------------------------------------------------- tables
+class TableWindow(tk.Toplevel):
+    """
+    A sortable table. Each column is (header, kind) with kind 'text', 'number' or
+    'percent'; rows hold raw values (None is shown as '-'). Click a header to sort.
+
+    Copying (Ctrl+C, right-click, buttons) yields tab-separated raw values, so it pastes
+    into Excel at full precision.
+    """
+
+    def __init__(self, master, title, columns, rows, on_open=None, geometry="1100x500"):
+        super().__init__(master)
+        self.title(title)
+        self.geometry(geometry)
+        self.columns = columns
+        self.rows = rows
+        self.on_open = on_open
+        self.sort_column = None
+        self.sort_reverse = True
+
+        frame = ttk.Frame(self, padding=6)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(frame, columns=[h for h, _ in columns], show="headings")
+        ys = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        xs = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        for index, (header, kind) in enumerate(columns):
+            self.tree.heading(header, text=header, command=lambda i=index: self._sort_by(i))
+            width = 420 if index == 0 else 110
+            self.tree.column(header, width=width, anchor="w" if kind == "text" else "e", stretch=index == 0)
+        if on_open is not None:
+            self.tree.bind("<Double-1>", self._open_selected)
+
+        self.tree.bind("<Control-c>", lambda e: self._copy_rows(self.tree.selection()))
+        self.tree.bind("<Control-C>", lambda e: self._copy_rows(self.tree.selection()))
+        self.tree.bind("<Control-a>", self._select_all)
+        self.tree.bind("<Control-A>", self._select_all)
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="Copy selected rows",
+                              command=lambda: self._copy_rows(self.tree.selection()))
+        self.menu.add_command(label="Copy all rows (with header)", command=self._copy_all)
+        self.tree.bind("<Button-3>", self._show_menu)
+
+        footer = ttk.Frame(frame)
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(footer, text="Copy all (with header)", command=self._copy_all).pack(side="left")
+        ttk.Button(footer, text="Copy selected", command=lambda: self._copy_rows(self.tree.selection())
+                   ).pack(side="left", padx=(6, 0))
+        hint = "Ctrl+C copies the selected rows; click a header to sort."
+        if on_open is not None:
+            hint += " Double-click a row to see its details."
+        ttk.Label(footer, text=hint, foreground="gray").pack(side="left", padx=(10, 0))
+        self._fill()
+
+    @staticmethod
+    def _format(value, kind):
+        if value is None:
+            return "-"
+        if kind == "percent":
+            return f"{value:.3f} %"
+        if kind == "number":
+            return f"{value:.4g}"
+        return str(value)
+
+    def _fill(self):
+        self.tree.delete(*self.tree.get_children())
+        for index, row in enumerate(self.rows):
+            shown = [self._format(v, kind) for v, (_, kind) in zip(row, self.columns)]
+            self.tree.insert("", "end", iid=str(index), values=shown)
+
+    def _sort_by(self, column_index):
+        """Sort by a column, toggling the direction on repeated clicks; missing values go last."""
+        self.sort_reverse = not self.sort_reverse if self.sort_column == column_index else True
+        self.sort_column = column_index
+
+        def is_missing(value):
+            return value is None or (isinstance(value, float) and value != value)  # None or NaN
+
+        present = [r for r in self.rows if not is_missing(r[column_index])]
+        missing = [r for r in self.rows if is_missing(r[column_index])]
+        present.sort(key=lambda r: r[column_index], reverse=self.sort_reverse)
+        self.rows = present + missing
+        self._fill()
+
+    def _select_all(self, _event=None):
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
+
+    def _show_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if row and row not in self.tree.selection():
+            self.tree.selection_set(row)
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    @staticmethod
+    def _plain(value):
+        return "" if value is None else str(value)
+
+    def _copy_text(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()  # Keeps the text on the clipboard after the window is closed.
+
+    def _copy_rows(self, selection):
+        """Copy the selected rows (all rows if none is selected), without the header."""
+        indices = [int(iid) for iid in selection] if selection else range(len(self.rows))
+        lines = ["\t".join(self._plain(v) for v in self.rows[i]) for i in sorted(indices)]
+        self._copy_text("\n".join(lines))
+        return "break"
+
+    def _copy_all(self):
+        header = "\t".join(h for h, _ in self.columns)
+        lines = ["\t".join(self._plain(v) for v in row) for row in self.rows]
+        self._copy_text("\n".join([header, *lines]))
+
+    def _open_selected(self, _event):
+        selection = self.tree.selection()
+        if selection:
+            self.on_open(self.rows[int(selection[0])])
+
+
 # --------------------------------------------------------------------------- GUI
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CSV branch compare")
-        self.geometry("1150x680")
+        self.geometry("1150x720")
         self.minsize(800, 500)
 
         self.comparison = None
@@ -312,6 +536,7 @@ class App(tk.Tk):
         self.df_before = self.df_after = None
         self.file_name = ""
         self.columns = []
+        self.file_changes = None  # Filled by "Summary (all files)", reset on every load.
 
         self._build_controls()
         self._build_plot()
@@ -358,12 +583,16 @@ class App(tk.Tk):
         self.base_label.grid(row=7, column=0, sticky="w", pady=(8, 0))
 
         self.status = ttk.Label(side, text="", justify="left")
-        self.status.grid(row=8, column=0, sticky="ew", pady=(10, 10))
+        self.status.grid(row=8, column=0, sticky="ew", pady=(10, 6))
         side.bind("<Configure>", lambda e: self.status.configure(wraplength=max(e.width - 30, 100)))
 
-        self.file_list = self._make_list(side, "Changed CSV files", first_row=9, weight=2)
-        self.x_list = self._make_list(side, "X axis", first_row=11, weight=1)
-        self.y_list = self._make_list(side, "Y axis", first_row=13, weight=1)
+        self.summary_btn = ttk.Button(side, text="Summary (all files)", command=self.show_summary,
+                                      state="disabled")
+        self.summary_btn.grid(row=9, column=0, sticky="ew", pady=(0, 4))
+
+        self.file_list = self._make_list(side, "Changed CSV files", first_row=10, weight=2)
+        self.x_list = self._make_list(side, "X axis", first_row=12, weight=1)
+        self.y_list = self._make_list(side, "Y axis", first_row=14, weight=1)
         self.file_list.bind("<<ListboxSelect>>", self.on_file_selected)
         for lb in (self.x_list, self.y_list):
             lb.bind("<<ListboxSelect>>", lambda e: self.update_plot())
@@ -430,8 +659,10 @@ class App(tk.Tk):
             self._set_status("Type a branch name first, or tick 'Use current working tree'.", error=True)
             return
         self.load_btn.configure(state="disabled")
+        self.summary_btn.configure(state="disabled")
         self._set_status("Loading..." if use_working_tree else f"Loading '{branch}' (fetching from remote)...")
         self._reset_file_and_columns()
+        self.file_changes = None
         self.file_list.delete(0, "end")
         self.base_label.configure(text="Before (split from): -")
 
@@ -460,8 +691,9 @@ class App(tk.Tk):
         for label in labels:
             self.file_list.insert("end", label)
         self._fit_names(labels)
+        self.summary_btn.configure(state="normal")
         self._set_status(f"{len(files)} CSV file(s) changed: {description}.")
-        self._show_placeholder("Choose a file.")
+        self._show_placeholder("Choose a file, or open the summary.")
 
     def _branch_failed(self, message):
         self.load_btn.configure(state="normal")
@@ -474,13 +706,6 @@ class App(tk.Tk):
         for lb in (self.x_list, self.y_list):
             lb.delete(0, "end")
 
-    def _read_pair(self, status, old, new):
-        """Return the (before, after) DataFrames of a changed file (None if it does not exist)."""
-        comparison = self.comparison
-        before = None if status == "A" else read_csv(read_version(comparison.base_rev, old, self.repo_root))
-        after = None if status == "D" else read_csv(read_version(comparison.head_rev, new, self.repo_root))
-        return before, after
-
     def on_file_selected(self, _event=None):
         sel = self.file_list.curselection()
         if not sel:
@@ -488,7 +713,7 @@ class App(tk.Tk):
         status, old, new = self.files[sel[0]]
         self._reset_file_and_columns()
         try:
-            self.df_before, self.df_after = self._read_pair(status, old, new)
+            self.df_before, self.df_after = read_pair(self.comparison, self.repo_root, status, old, new)
         except Exception as exc:
             self._set_status(f"Could not read {new}:\n{exc}", error=True)
             return
@@ -513,6 +738,67 @@ class App(tk.Tk):
         self._set_status(f"File: {new}\n{len(self.columns)} columns. Choose the X and Y axes.")
         self._show_placeholder("Choose the X and Y columns.")
 
+    # ------------------------------------------------------------------ summary
+    def show_summary(self):
+        if self.file_changes is not None:
+            self._open_summary()
+            return
+        self.summary_btn.configure(state="disabled")
+        self._set_status(f"Reading {len(self.files)} file(s) for the summary...")
+        comparison, repo_root, files = self.comparison, self.repo_root, list(self.files)
+
+        def work():
+            try:
+                changes = [FileChange.FromFrames(status, old, new,
+                                                 *read_pair(comparison, repo_root, status, old, new))
+                           for status, old, new in files]
+                self.after(0, self._summary_ready, comparison, changes)
+            except Exception as exc:
+                self.after(0, self._summary_failed, comparison, str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _summary_failed(self, comparison, message):
+        if comparison is not self.comparison:  # Another load started meanwhile.
+            return
+        self.summary_btn.configure(state="normal")
+        self._set_status(f"Could not build the summary:\n{message}", error=True)
+
+    def _summary_ready(self, comparison, changes):
+        if comparison is not self.comparison:
+            return
+        self.file_changes = changes
+        self.summary_btn.configure(state="normal")
+        self._set_status(f"Summary of {len(changes)} file(s) ready.")
+        self._open_summary()
+
+    def _open_summary(self):
+        columns = [("File", "text"), ("Rows before", "number"), ("Rows after", "number"),
+                   ("Columns changed", "number"), ("Numeric columns", "number"),
+                   ("Mean difference (%)", "percent"), ("Max difference (%)", "percent"),
+                   ("Column with the max difference", "text")]
+        rows = [(c.label, c.rows_before, c.rows_after, c.changed_columns, c.numeric_columns,
+                 c.mean_percent, c.max_percent, c.worst_column) for c in self.file_changes]
+        rows.sort(key=lambda r: (r[6] is None, -(r[6] or 0.0)))  # Biggest change first.
+        by_label = {c.label: c for c in self.file_changes}
+        title = f"Summary: '{self.comparison.head_label}' vs '{self.comparison.base_label}'"
+        TableWindow(self, title, columns, rows,
+                    on_open=lambda row: self._open_columns(by_label[row[0]]), geometry="1250x520")
+
+    def _open_columns(self, file_change):
+        if not file_change.columns:
+            messagebox.showinfo("CSV branch compare",
+                                "No numeric columns to compare (file added, deleted or non-numeric).")
+            return
+        columns = [("Column", "text"), ("Mean difference", "number"), ("Max difference", "number"),
+                   ("Mean difference (%)", "percent"), ("Max difference (%)", "percent")]
+        rows = [(c.column, c.mean_difference, c.max_difference, c.mean_percent, c.max_percent)
+                for c in file_change.columns]
+        rows.sort(key=lambda r: (r[4] != r[4], -r[4] if r[4] == r[4] else 0.0))  # NaN last.
+        note = " (differences are in each column's own unit; % is relative to the column's size)"
+        TableWindow(self, file_change.label + note, columns, rows)
+
+    # ------------------------------------------------------------------ plot
     def update_plot(self):
         xs, ys = self.x_list.curselection(), self.y_list.curselection()
         if not xs or not ys:
