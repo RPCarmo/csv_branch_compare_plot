@@ -7,23 +7,23 @@ Run it from inside your local clone of the repository, with an environment that 
 pandas and matplotlib (e.g. the repository's pixi environment):
     pixi run python csv_branch_compare.py
 
-In the window, type a branch name and press Load:
-    my-branch          -> local branch
-    origin/my-branch   -> branch on the remote
-Either way, all branches of the remote are fetched first, using your normal git
-credentials (SSH keys, credential manager, etc.).
+In the window, choose what to compare and press Load:
+    After:  a branch (my-branch = local, origin/my-branch = remote), or the current
+            working tree, i.e. the files on disk with uncommitted changes and new
+            untracked CSVs.
+    Before: where the branch split from, or any branch, tag or commit you type
+            (e.g. my-branch~1 to see only the last commit, HEAD to see only the
+            uncommitted changes).
+Branches and split points need all branches of the remote to be fetched first, using
+your normal git credentials (SSH keys, credential manager, etc.).
 Then pick a changed CSV file and the X and Y columns. The "before" and "after"
 curves are plotted together; nothing is saved to disk.
 
-By default, "before" is the file where the branch split off from the branch it was
-created from (shown in the window), so the plot shows only the changes introduced by
-the branch. Git doesn't record that branch, so it is inferred from the history: see
-`find_base`. Fill in the "Base" field to compare against any other branch, tag or
-commit instead (e.g. my-branch~1 to see only the last commit).
-
-Tick "Use current working tree" to compare the uncommitted files on disk (including new
-untracked CSVs) instead of a branch; "before" is then HEAD unless "Base" is filled in,
-and nothing is fetched.
+"Where the branch split from" is the point where the branch (for the working tree, the
+checked-out branch) split off from the branch it was created from, so the plot shows
+only the changes introduced by the branch. Git doesn't record that branch, so it is
+inferred from the history: see `find_base`. It is looked up as soon as the option is
+chosen.
 
 "Summary (all files)" lists, for each changed file, how much its numbers changed (mean
 and maximum difference, as a percentage of each column's size); double-click a file
@@ -193,46 +193,114 @@ def find_base(head_ref, branch, remote):
 
 
 @dataclass(frozen=True)
+class BranchSide:
+    """'After' is a branch, already fetched when it lives on the remote."""
+
+    head_ref: str
+    branch_name: str
+    """The name without the remote prefix, as `find_base` expects it."""
+    remote: str | None
+    label: str
+
+    @property
+    def head_rev(self) -> str:
+        return self.head_ref
+
+
+@dataclass(frozen=True)
+class WorkingTreeSide:
+    """'After' is the files on disk, uncommitted changes included."""
+
+    label: str = "working tree"
+
+    @property
+    def head_rev(self) -> None:
+        return None
+
+
+AfterSide = BranchSide | WorkingTreeSide
+
+
+def resolve_after(branch: str, use_working_tree: bool) -> AfterSide:
+    """Resolve the 'after' side chosen in the window; only a branch is fetched."""
+    if use_working_tree:
+        return WorkingTreeSide()
+    if not branch:
+        raise GitError("Type the 'after' branch name.")
+    head_ref, branch_name, remote = resolve_branch(branch)
+    return BranchSide(head_ref, branch_name, remote, branch)
+
+
+@dataclass(frozen=True)
+class SplitPoint:
+    """Where a branch split off the branch it was created from."""
+
+    rev: str
+    """The merge-base with the parent branch."""
+    parent: str
+    branch: str
+
+
+def find_split_point(after: AfterSide) -> SplitPoint:
+    """
+    Find where the 'after' branch split off; for the working tree, the checked-out branch.
+
+    The checked-out branch is resolved like a typed one, so its remote is fetched too.
+    """
+    match after:
+        case BranchSide():
+            head_ref, branch, remote = after.head_ref, after.branch_name, after.remote
+        case WorkingTreeSide():
+            current = git_text("branch", "--show-current")
+            if not current:
+                raise GitError("HEAD is detached, so it has no split point. "
+                               "Choose a branch, tag or commit for 'before'.")
+            head_ref, branch, remote = resolve_branch(current)
+    parent_ref, parent = find_base(head_ref, branch, remote)
+    return SplitPoint(git_text("merge-base", parent_ref, head_ref), parent, branch)
+
+
+@dataclass(frozen=True)
+class AfterChoice:
+    """What the user chose for 'after', before anything is resolved or fetched."""
+
+    use_working_tree: bool
+    branch: str
+    """The typed branch or, for the working tree, the checked-out one, so that checking out
+    another branch is noticed."""
+
+    def resolve(self) -> AfterSide:
+        return resolve_after(self.branch, self.use_working_tree)
+
+
+@dataclass(frozen=True)
+class FoundSplitPoint:
+    """A split point together with the 'after' choice it was found for."""
+
+    choice: AfterChoice
+    after: AfterSide
+    split: SplitPoint
+
+
+def resolve_typed_base(base: str) -> str:
+    """Commit of a base typed by the user, failing with a readable message."""
+    if not base:
+        raise GitError("Type the 'before' branch, tag or commit.")
+    if not ref_exists(base):
+        raise GitError(f"'{base}' is not a known branch, tag or commit.")
+    return git_text("rev-parse", "--verify", f"{base}^{{commit}}")
+
+
+@dataclass(frozen=True)
 class Comparison:
     """What is being compared: the 'before' commit and the 'after' side."""
 
     base_rev: str
     base_label: str
     """The branch, tag or commit 'before' comes from, as shown to the user."""
-    base_is_split_point: bool
-    """Whether `base_rev` was inferred as the point where the branch split off."""
     head_rev: str | None
     """Commit of the 'after' side, or None to use the working tree (uncommitted files)."""
     head_label: str
-
-
-def resolve_typed_base(base: str) -> str:
-    """Commit of a base typed by the user, failing with a readable message."""
-    if not ref_exists(base):
-        raise GitError(f"Base '{base}' is not a known branch, tag or commit.")
-    return git_text("rev-parse", "--verify", f"{base}^{{commit}}")
-
-
-def resolve_comparison(branch: str, base: str, use_working_tree: bool) -> Comparison:
-    """
-    Work out 'before' and 'after' from what the user typed in the window.
-
-    An empty `base` means the point where the branch split off the branch it was created
-    from, or HEAD when comparing the working tree. The branch is resolved (and fetched)
-    first, so a typed remote base is current; the working tree never fetches.
-    """
-    if use_working_tree:
-        base = base or "HEAD"
-        return Comparison(resolve_typed_base(base), base, False, None, "working tree (uncommitted)")
-
-    if not branch:
-        raise GitError("Type a branch name, or tick 'Use current working tree'.")
-    head_ref, branch_name, remote = resolve_branch(branch)
-    if base:
-        return Comparison(resolve_typed_base(base), base, False, head_ref, branch)
-    base_ref, base_label = find_base(head_ref, branch_name, remote)
-    base_rev = git_text("merge-base", base_ref, head_ref)
-    return Comparison(base_rev, base_label, True, head_ref, branch)
 
 
 def changed_csvs(base_rev, head_rev):
@@ -523,6 +591,107 @@ class TableWindow(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------- GUI
+CHOSEN_BACKGROUND = "#dce9f8"
+
+
+def configure_option_styles(root: tk.Misc) -> None:
+    """Styles for `OptionRow`: the chosen row gets a tinted background and a bold title."""
+    style = ttk.Style(root)
+    bold = tkfont.nametofont("TkDefaultFont").copy()
+    bold.configure(weight="bold")
+    root.option_bold_font = bold  # Keeps the font alive; Tk only holds its name.
+    style.configure("Chosen.TFrame", background=CHOSEN_BACKGROUND)
+    style.configure("Chosen.TRadiobutton", background=CHOSEN_BACKGROUND, font=bold)
+    style.configure("Chosen.TLabel", background=CHOSEN_BACKGROUND)
+    style.configure("Hint.TLabel", foreground="gray")
+    style.configure("ChosenHint.TLabel", background=CHOSEN_BACKGROUND, foreground="gray")
+
+
+class Tooltip:
+    """Shows a text below a widget while the mouse is over it; `text` may change later."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.window = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event):
+        if self.window is not None or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 2
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
+                 justify="left", padx=4, pady=2).pack()
+
+    def _hide(self, _event):
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
+class OptionRow:
+    """
+    One choice of a radio group, on a single line: the radio button, then the entry or
+    text that belongs to it.
+
+    Its entry only accepts typing while it is the chosen row, and the chosen row is
+    highlighted, so it is clear which inputs the comparison will use.
+    """
+
+    LABEL_STYLES = {
+        (False, False): "TLabel",
+        (False, True): "Hint.TLabel",
+        (True, False): "Chosen.TLabel",
+        (True, True): "ChosenHint.TLabel",
+    }
+    """Label style by (row is chosen, label is a hint)."""
+
+    RADIO_WIDTH = 105
+    """Lines up the entries and texts of the rows in a column."""
+
+    def __init__(self, parent, variable, value, text, command, tooltip):
+        self.frame = ttk.Frame(parent, padding=(2, 1))
+        self.frame.columnconfigure(0, minsize=self.RADIO_WIDTH)
+        self.frame.columnconfigure(1, weight=1)
+        self.radio = ttk.Radiobutton(self.frame, text=text, variable=variable, value=value, command=command)
+        self.radio.grid(row=0, column=0, sticky="w")
+        Tooltip(self.radio, tooltip)
+        self.entries = []
+        self.labels = []
+        """(label, is_hint) pairs."""
+
+    def add_entry(self, textvariable, tooltip):
+        entry = ttk.Entry(self.frame, textvariable=textvariable)
+        entry.grid(row=0, column=1, sticky="ew")
+        Tooltip(entry, tooltip)
+        self.entries.append(entry)
+        return entry
+
+    def add_label(self, text, hint=False):
+        label = ttk.Label(self.frame, text=text, justify="left")
+        label.grid(row=0, column=1, sticky="w")
+        self.labels.append((label, hint))
+        return label
+
+    def set_chosen(self, chosen):
+        prefix = "Chosen." if chosen else ""
+        self.frame.configure(style=f"{prefix}TFrame")
+        self.radio.configure(style=f"{prefix}TRadiobutton")
+        for label, hint in self.labels:
+            label.configure(style=self.LABEL_STYLES[chosen, hint])
+        for entry in self.entries:
+            entry.configure(state="normal" if chosen else "disabled")
+
+    def set_wraplength(self, width):
+        for label, _ in self.labels:
+            label.configure(wraplength=width)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -537,10 +706,14 @@ class App(tk.Tk):
         self.file_name = ""
         self.columns = []
         self.file_changes = None  # Filled by "Summary (all files)", reset on every load.
+        self.split_found = None
+        """The last split point found, reused while the 'after' choice stays the same."""
+        self.split_job = 0
+        """Bumped whenever a split point lookup becomes stale, so its result is ignored."""
 
         self._build_controls()
         self._build_plot()
-        self._show_placeholder("Enter a branch name (or tick 'Use current working tree') and press Load.")
+        self._show_placeholder("Choose 'after' and 'before', then press Load.")
 
     # ------------------------------------------------------------------ layout
     def _build_controls(self):
@@ -553,58 +726,106 @@ class App(tk.Tk):
         self.panes.add(side, minsize=300, width=380, stretch="never")
         side.columnconfigure(0, weight=1)
 
-        ttk.Label(side, text="Branch (after)").grid(row=0, column=0, sticky="w")
-        row = ttk.Frame(side)
-        row.grid(row=1, column=0, sticky="ew", pady=(2, 2))
+        configure_option_styles(self)
+
+        after_box = ttk.LabelFrame(side, text="After", padding=(2, 0))
+        after_box.grid(row=0, column=0, sticky="ew")
+        after_box.columnconfigure(0, weight=1)
+        self.after_mode = tk.StringVar(value="branch")
         self.branch_var = tk.StringVar()
-        self.branch_entry = ttk.Entry(row, textvariable=self.branch_var)
-        self.branch_entry.pack(side="left", fill="x", expand=True)
+        self.after_branch = OptionRow(after_box, self.after_mode, "branch", "Branch", self._on_after_chosen,
+                                      tooltip="A branch: my-branch = local, origin/my-branch = remote.")
+        self.branch_entry = self.after_branch.add_entry(
+            self.branch_var, tooltip="my-branch = local, origin/my-branch = remote (fetched first).")
         self.branch_entry.bind("<Return>", lambda e: self.load_branch())
-        self.branch_entry.focus_set()
-        self.load_btn = ttk.Button(row, text="Load", command=self.load_branch)
-        self.load_btn.pack(side="left", padx=(6, 0))
-        ttk.Label(side, text="my-branch = local, origin/my-branch = remote",
-                  foreground="gray").grid(row=2, column=0, sticky="w")
+        self.branch_entry.bind("<FocusOut>", lambda e: self._on_after_changed())
+        self.after_working_tree = OptionRow(
+            after_box, self.after_mode, "working_tree", "Working tree", self._on_after_chosen,
+            tooltip="The files on disk of the checked-out branch, including uncommitted changes\n"
+                    "and new untracked CSV files.")
+        self.after_working_tree.add_label("incl. uncommitted changes", hint=True)
 
-        self.working_tree_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(side, text="Use current working tree (including uncommitted changes) as 'after'",
-                        variable=self.working_tree_var,
-                        command=self._on_working_tree_toggled).grid(row=3, column=0, sticky="w", pady=(6, 0))
-
-        ttk.Label(side, text="Base (before) - optional").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        before_box = ttk.LabelFrame(side, text="Before", padding=(2, 0))
+        before_box.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        before_box.columnconfigure(0, weight=1)
+        self.before_mode = tk.StringVar(value="split_point")
         self.base_var = tk.StringVar()
-        base_entry = ttk.Entry(side, textvariable=self.base_var)
-        base_entry.grid(row=5, column=0, sticky="ew", pady=(2, 2))
-        base_entry.bind("<Return>", lambda e: self.load_branch())
-        ttk.Label(side, text="empty = the branch it was created from (HEAD for the working tree)",
-                  foreground="gray").grid(row=6, column=0, sticky="w")
+        self.before_split = OptionRow(
+            before_box, self.before_mode, "split_point", "Split point", self._on_before_changed,
+            tooltip="Where the 'after' branch (or the checked-out one, for the working tree)\n"
+                    "split off from the branch it was created from.")
+        self.split_label = self.before_split.add_label("")
+        self.split_tooltip = Tooltip(self.split_label, "")
+        self.before_manual = OptionRow(before_box, self.before_mode, "manual", "Other", self._on_before_changed,
+                                       tooltip="Any branch, tag or commit you type.")
+        self.base_entry = self.before_manual.add_entry(
+            self.base_var, tooltip="Any branch, tag or commit, e.g. origin/master, my-branch~1, or HEAD\n"
+                                   "to see only the uncommitted changes of the working tree.")
+        self.base_entry.bind("<Return>", lambda e: self.load_branch())
 
-        self.base_label = ttk.Label(side, text="Before (split from): -")
-        self.base_label.grid(row=7, column=0, sticky="w", pady=(8, 0))
+        self.option_rows = (self.after_branch, self.after_working_tree, self.before_split, self.before_manual)
+        for index, option in enumerate(self.option_rows[:2]):
+            option.frame.grid(row=index, column=0, sticky="ew", pady=1)
+        for index, option in enumerate(self.option_rows[2:]):
+            option.frame.grid(row=index, column=0, sticky="ew", pady=1)
+
+        buttons = ttk.Frame(side)
+        buttons.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        buttons.columnconfigure((0, 1), weight=1, uniform="buttons")
+        self.load_btn = ttk.Button(buttons, text="Load", command=self.load_branch)
+        self.load_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.summary_btn = ttk.Button(buttons, text="Summary (all files)", command=self.show_summary,
+                                      state="disabled")
+        self.summary_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         self.status = ttk.Label(side, text="", justify="left")
-        self.status.grid(row=8, column=0, sticky="ew", pady=(10, 6))
-        side.bind("<Configure>", lambda e: self.status.configure(wraplength=max(e.width - 30, 100)))
+        self.status.grid(row=3, column=0, sticky="ew", pady=(4, 0))
 
-        self.summary_btn = ttk.Button(side, text="Summary (all files)", command=self.show_summary,
-                                      state="disabled")
-        self.summary_btn.grid(row=9, column=0, sticky="ew", pady=(0, 4))
+        def wrap_labels(event):
+            self.status.configure(wraplength=max(event.width - 30, 100))
+            for option in self.option_rows:
+                option.set_wraplength(max(event.width - OptionRow.RADIO_WIDTH - 40, 100))
 
-        self.file_list = self._make_list(side, "Changed CSV files", first_row=10, weight=2)
-        self.x_list = self._make_list(side, "X axis", first_row=12, weight=1)
-        self.y_list = self._make_list(side, "Y axis", first_row=14, weight=1)
+        side.bind("<Configure>", wrap_labels)
+        self._on_after_changed()
+        self.branch_entry.focus_set()
+
+        self.file_list = self._make_list(side, "Changed CSV files", first_row=5, weight=2)
+        self.x_list = self._make_list(side, "X axis", first_row=7, weight=1)
+        self.y_list = self._make_list(side, "Y axis", first_row=9, weight=1)
         self.file_list.bind("<<ListboxSelect>>", self.on_file_selected)
         for lb in (self.x_list, self.y_list):
             lb.bind("<<ListboxSelect>>", lambda e: self.update_plot())
 
         self.list_font = tkfont.Font(font=self.file_list.cget("font"))
 
-    def _on_working_tree_toggled(self):
-        self.branch_entry.configure(state="disabled" if self.working_tree_var.get() else "normal")
+    def _refresh_option_rows(self):
+        for option, chosen in ((self.after_branch, self.after_mode.get() == "branch"),
+                               (self.after_working_tree, self.after_mode.get() == "working_tree"),
+                               (self.before_split, self.before_mode.get() == "split_point"),
+                               (self.before_manual, self.before_mode.get() == "manual")):
+            option.set_chosen(chosen)
+
+    def _on_after_chosen(self):
+        self._on_after_changed()
+        if self.after_mode.get() == "branch":
+            self.branch_entry.focus_set()
+
+    def _on_after_changed(self):
+        self._refresh_option_rows()
+        if self.before_mode.get() == "split_point":
+            self._find_split_point()
+
+    def _on_before_changed(self):
+        self._refresh_option_rows()
+        if self.before_mode.get() == "split_point":
+            self._find_split_point()
+        else:
+            self.base_entry.focus_set()
 
     def _make_list(self, parent, title, first_row, weight):
         """A labelled listbox with vertical and horizontal scrollbars."""
-        ttk.Label(parent, text=title).grid(row=first_row, column=0, sticky="w", pady=(8, 2))
+        ttk.Label(parent, text=title).grid(row=first_row, column=0, sticky="w", pady=(6, 1))
         frame = ttk.Frame(parent)
         frame.grid(row=first_row + 1, column=0, sticky="nsew")
         parent.rowconfigure(first_row + 1, weight=weight)
@@ -651,37 +872,101 @@ class App(tk.Tk):
         self.status.configure(text=text, foreground="#b00020" if error else "")
 
     # ------------------------------------------------------------------ actions
-    def load_branch(self):
-        branch = self.branch_var.get().strip()
-        base = self.base_var.get().strip()
-        use_working_tree = self.working_tree_var.get()
-        if not branch and not use_working_tree:
-            self._set_status("Type a branch name first, or tick 'Use current working tree'.", error=True)
+    def _after_choice(self):
+        if self.after_mode.get() == "working_tree":
+            return AfterChoice(True, git_text("branch", "--show-current"))
+        return AfterChoice(False, self.branch_var.get().strip())
+
+    def _show_split_message(self, text, error=False, tooltip=""):
+        self.split_label.configure(text=text, foreground="#b00020" if error else "")
+        self.split_tooltip.text = tooltip
+
+    def _show_split_point(self, split):
+        self._show_split_message(f"{split.parent} ({split.rev[:10]})",
+                                 tooltip=f"'{split.branch}' split from {split.parent} at {split.rev}")
+
+    def _find_split_point(self):
+        """Show where the 'after' branch split from, looking it up in the background if needed."""
+        choice = self._after_choice()
+        if self.split_found is not None and self.split_found.choice == choice:
+            self._show_split_point(self.split_found.split)
             return
+        self.split_job += 1  # Results of earlier lookups are now stale.
+        if not choice.use_working_tree and not choice.branch:
+            self._show_split_message("Type the 'after' branch first.")
+            return
+        job = self.split_job
+        self._show_split_message("Finding it (fetching from remote)...")
+
+        def work():
+            try:
+                after = choice.resolve()
+                split = find_split_point(after)
+                self.after(0, self._split_point_found, job, FoundSplitPoint(choice, after, split))
+            except Exception as exc:
+                self.after(0, self._split_point_failed, job, str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _split_point_found(self, job, found):
+        self.split_found = found
+        if job == self.split_job:
+            self._show_split_point(found.split)
+
+    def _split_point_failed(self, job, message):
+        if job == self.split_job:
+            self._show_split_message(message, error=True)
+
+    def load_branch(self):
+        choice = self._after_choice()
+        use_split_point = self.before_mode.get() == "split_point"
+        base = self.base_var.get().strip()
+        if not choice.use_working_tree and not choice.branch:
+            self._set_status("Type the 'after' branch name first.", error=True)
+            return
+        if not use_split_point and not base:
+            self._set_status("Type the 'before' branch, tag or commit first.", error=True)
+            return
+        found = self.split_found if self.split_found is not None and self.split_found.choice == choice else None
+        if use_split_point and found is None:
+            self.split_job += 1  # This load looks it up itself; a lookup still running is stale.
+            self._show_split_message("Finding it (fetching from remote)...")
+        fetching = not choice.use_working_tree or (use_split_point and found is None)
         self.load_btn.configure(state="disabled")
         self.summary_btn.configure(state="disabled")
-        self._set_status("Loading..." if use_working_tree else f"Loading '{branch}' (fetching from remote)...")
+        self._set_status("Loading..." + (" (fetching from remote)" if fetching else ""))
         self._reset_file_and_columns()
         self.file_changes = None
         self.file_list.delete(0, "end")
-        self.base_label.configure(text="Before (split from): -")
 
         def work():  # runs in a background thread so the window stays responsive
             try:
-                comparison = resolve_comparison(branch, base, use_working_tree)
+                if use_split_point:
+                    if found is None:
+                        after = choice.resolve()
+                        new_found = FoundSplitPoint(choice, after, find_split_point(after))
+                    else:
+                        new_found = found
+                    split = new_found.split
+                    comparison = Comparison(split.rev, split.parent, new_found.after.head_rev, new_found.after.label)
+                else:
+                    new_found = None
+                    after = choice.resolve()
+                    comparison = Comparison(resolve_typed_base(base), base, after.head_rev, after.label)
                 files = changed_csvs(comparison.base_rev, comparison.head_rev)
-                self.after(0, self._branch_loaded, comparison, files)
+                self.after(0, self._branch_loaded, comparison, files, new_found)
             except Exception as exc:  # GitError or anything unexpected
                 self.after(0, self._branch_failed, str(exc))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _branch_loaded(self, comparison, files):
+    def _branch_loaded(self, comparison, files, found):
         self.load_btn.configure(state="normal")
         self.comparison, self.files = comparison, files
-        sha = comparison.base_rev[:10]
-        commit = f"merge-base {sha}" if comparison.base_is_split_point else sha
-        self.base_label.configure(text=f"Before (split from): {comparison.base_label} ({commit})")
+        if found is not None:
+            self.split_found = found
+            if self.before_mode.get() == "split_point":
+                self._show_split_point(found.split)
         description = f"'{comparison.head_label}' vs '{comparison.base_label}'"
         if not files:
             self._set_status(f"No CSV files changed: {description}.")
@@ -698,6 +983,9 @@ class App(tk.Tk):
     def _branch_failed(self, message):
         self.load_btn.configure(state="normal")
         self._set_status(message, error=True)
+        if self.before_mode.get() == "split_point" and (
+                self.split_found is None or self.split_found.choice != self._after_choice()):
+            self._show_split_message("Not found; see the message below.", error=True)
         self._show_placeholder("Could not load the comparison.")
 
     def _reset_file_and_columns(self):
