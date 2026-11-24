@@ -2,8 +2,9 @@
 """
 csv_branch_compare.py - compare, as plots, the CSV files changed in a git branch.
 
-Run it from inside your local clone of the repository:
-    python csv_branch_compare.py
+Run it from inside your local clone of the repository, with an environment that has
+pandas and matplotlib (e.g. the repository's pixi environment):
+    pixi run python csv_branch_compare.py
 
 In the window, type a branch name and press Load:
     my-branch          -> local branch
@@ -23,16 +24,26 @@ Requires: git on PATH, Python 3.9+, pandas, matplotlib (Tkinter ships with Pytho
 import io
 import os
 import subprocess
+import sys
 import textwrap
 import threading
-import tkinter as tk
 import warnings
-from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
 
-import pandas as pd
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
+
+    import pandas as pd
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    from matplotlib.figure import Figure
+except ImportError as import_error:
+    sys.exit(
+        f"Missing dependency: '{import_error.name}'.\n"
+        "This script needs pandas, matplotlib and Tkinter. Run it with an environment "
+        "that has them, e.g. from the repository folder:\n"
+        f"    pixi run python {sys.argv[0]}"
+    )
 
 DEFAULT_REMOTE = "origin"  # used to find the default branch name for local branches
 
