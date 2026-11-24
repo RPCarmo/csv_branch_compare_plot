@@ -27,7 +27,7 @@ and nothing is fetched.
 
 "Summary (all files)" lists, for each changed file, how much its numbers changed (mean
 and maximum difference, as a percentage of each column's size); double-click a file
-there to see the same numbers per column.
+there to see the same numbers per column, and on a column to see its values row by row.
 
 Requires: git on PATH, Python 3.10+, pandas, matplotlib (Tkinter ships with Python)
 """
@@ -796,7 +796,48 @@ class App(tk.Tk):
                 for c in file_change.columns]
         rows.sort(key=lambda r: (r[4] != r[4], -r[4] if r[4] == r[4] else 0.0))  # NaN last.
         note = " (differences are in each column's own unit; % is relative to the column's size)"
-        TableWindow(self, file_change.label + note, columns, rows)
+        TableWindow(self, file_change.label + note, columns, rows,
+                    on_open=lambda row: self._open_values(file_change, row[0]))
+
+    def _open_values(self, file_change, column):
+        """
+        Show one column's values, before and after, row by row.
+
+        The file's first other column is shown alongside as a row label, which is usually
+        the X/time column.
+        """
+        try:
+            before, after = read_pair(self.comparison, self.repo_root,
+                                      file_change.status, file_change.old, file_change.new)
+        except Exception as exc:
+            messagebox.showerror("CSV branch compare", f"Could not read the file:\n{exc}")
+            return
+        frames = {"before": before, "after": after}
+        series = {name: pd.to_numeric(frame[column], errors="coerce").tolist()
+                  for name, frame in frames.items() if frame is not None and column in frame.columns}
+        reference = after if after is not None else before
+        label_column = next((c for c in reference.columns if str(c) != column), None)
+        labels = {}
+        if label_column is not None:
+            labels = {name: frame[label_column].tolist()
+                      for name, frame in frames.items() if frame is not None and label_column in frame.columns}
+        total = max((len(v) for v in series.values()), default=0)
+
+        def at(values, index):
+            return values[index] if values is not None and index < len(values) else None
+
+        rows = []
+        for index in range(total):
+            old, new = at(series.get("before"), index), at(series.get("after"), index)
+            difference = new - old if old is not None and new is not None else None
+            label = at(labels.get("after"), index)
+            if label is None:
+                label = at(labels.get("before"), index)
+            rows.append((index, "" if label is None else label, old, new, difference))
+        columns = [("Row", "number"), (str(label_column) if label_column is not None else "-", "text"),
+                   ("Before", "number"), ("After", "number"), ("After - before", "number")]
+        title = f"{column}  |  {os.path.basename(file_change.new)}"
+        TableWindow(self, title, columns, rows, geometry="900x600")
 
     # ------------------------------------------------------------------ plot
     def update_plot(self):
