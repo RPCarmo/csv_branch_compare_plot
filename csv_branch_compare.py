@@ -502,9 +502,9 @@ class App(tk.Tk):
             note = ""
             if self.df_before is not None and self.df_after is not None:
                 if c not in cols_before:
-                    note = "  (new in branch)"
+                    note = "  (new in 'after')"
                 elif c not in cols_after:
-                    note = "  (removed in branch)"
+                    note = "  (removed in 'after')"
             labels.append(f"{c}{note}")
         for lb in (self.x_list, self.y_list):
             lb.insert("end", *labels)
@@ -522,8 +522,8 @@ class App(tk.Tk):
         self.fig.clf()
         ax = self.fig.add_subplot()
         notes = []
-        curves = ((self.df_before, "Before", dict(color="tab:blue", linestyle="--")),
-                  (self.df_after, "After", dict(color="tab:orange")))
+        curves = ((self.df_before, "before", dict(color="tab:blue", linestyle="--")),
+                  (self.df_after, "after", dict(color="tab:orange")))
         x_is_date = False
         for df, name, style in curves:
             if df is None:
@@ -536,7 +536,7 @@ class App(tk.Tk):
             x_is_date = x_is_date or pd.api.types.is_datetime64_any_dtype(xs)
             marker = "." if len(df) <= 300 else None
             try:
-                ax.plot(xs, as_plottable(df[y]), marker=marker, label=name, **style)
+                ax.plot(xs, as_plottable(df[y]), marker=marker, label=f"{name} ({len(df)} rows)", **style)
             except Exception as exc:
                 notes.append(f"{name}: could not plot ({exc})")
 
