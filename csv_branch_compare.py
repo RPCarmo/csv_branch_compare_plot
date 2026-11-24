@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-csv_branch_compare.py - compare, as plots, the CSV files changed in a git branch.
+csv_branch_compare.py - compare, as plots, the CSV files changed in a git branch or in
+the working tree.
 
 Run it from inside your local clone of the repository, with an environment that has
 pandas and matplotlib (e.g. the repository's pixi environment):
@@ -18,10 +19,13 @@ By default, "before" is the file where the branch split off from the branch it w
 created from (shown in the window), so the plot shows only the changes introduced by
 the branch. Git doesn't record that branch, so it is inferred from the history: see
 `find_base`. Fill in the "Base" field to compare against any other branch, tag or
-commit instead (e.g. my-branch~1 to see only the last commit). Only committed changes
-are compared.
+commit instead (e.g. my-branch~1 to see only the last commit).
 
-Requires: git on PATH, Python 3.9+, pandas, matplotlib (Tkinter ships with Python)
+Tick "Use current working tree" to compare the uncommitted files on disk (including new
+untracked CSVs) instead of a branch; "before" is then HEAD unless "Base" is filled in,
+and nothing is fetched.
+
+Requires: git on PATH, Python 3.10+, pandas, matplotlib (Tkinter ships with Python)
 """
 import io
 import os
@@ -31,6 +35,7 @@ import textwrap
 import threading
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     import tkinter as tk
@@ -192,33 +197,48 @@ class Comparison:
     """The branch, tag or commit 'before' comes from, as shown to the user."""
     base_is_split_point: bool
     """Whether `base_rev` was inferred as the point where the branch split off."""
-    head_rev: str
+    head_rev: str | None
+    """Commit of the 'after' side, or None to use the working tree (uncommitted files)."""
     head_label: str
 
 
-def resolve_comparison(branch: str, base: str) -> Comparison:
+def resolve_typed_base(base: str) -> str:
+    """Commit of a base typed by the user, failing with a readable message."""
+    if not ref_exists(base):
+        raise GitError(f"Base '{base}' is not a known branch, tag or commit.")
+    return git_text("rev-parse", "--verify", f"{base}^{{commit}}")
+
+
+def resolve_comparison(branch: str, base: str, use_working_tree: bool) -> Comparison:
     """
     Work out 'before' and 'after' from what the user typed in the window.
 
     An empty `base` means the point where the branch split off the branch it was created
-    from. The branch is resolved (and fetched) first, so a typed remote base is current.
+    from, or HEAD when comparing the working tree. The branch is resolved (and fetched)
+    first, so a typed remote base is current; the working tree never fetches.
     """
+    if use_working_tree:
+        base = base or "HEAD"
+        return Comparison(resolve_typed_base(base), base, False, None, "working tree (uncommitted)")
+
     if not branch:
-        raise GitError("Type a branch name.")
+        raise GitError("Type a branch name, or tick 'Use current working tree'.")
     head_ref, branch_name, remote = resolve_branch(branch)
     if base:
-        if not ref_exists(base):
-            raise GitError(f"Base '{base}' is not a known branch, tag or commit.")
-        base_rev = git_text("rev-parse", "--verify", f"{base}^{{commit}}")
-        return Comparison(base_rev, base, False, head_ref, branch)
+        return Comparison(resolve_typed_base(base), base, False, head_ref, branch)
     base_ref, base_label = find_base(head_ref, branch_name, remote)
     base_rev = git_text("merge-base", base_ref, head_ref)
     return Comparison(base_rev, base_label, True, head_ref, branch)
 
 
 def changed_csvs(base_rev, head_rev):
-    """Return (status, old_path, new_path) for every CSV changed between two revisions."""
-    raw = run_git("diff", "--name-status", "-M", "-z", base_rev, head_rev)
+    """Return (status, old_path, new_path) for every CSV changed between 'before' and 'after'.
+    A head_rev of None means the working tree, which also includes new untracked CSVs.
+    Paths are relative to the repository root."""
+    diff_args = ["diff", "--name-status", "-M", "-z", base_rev]
+    if head_rev is not None:
+        diff_args.append(head_rev)
+    raw = run_git(*diff_args)
     parts = [p for p in raw.decode("utf-8", "replace").split("\0") if p]
     files, i = [], 0
     while i < len(parts):
@@ -231,6 +251,12 @@ def changed_csvs(base_rev, head_rev):
             i += 2
         if old.lower().endswith(".csv") or new.lower().endswith(".csv"):
             files.append((status, old, new))
+    if head_rev is None:
+        # ":/" and --full-name keep paths repo-relative even when run from a subfolder.
+        untracked = run_git("ls-files", "--others", "--exclude-standard", "--full-name", "-z", ":/")
+        for path in untracked.decode("utf-8", "replace").split("\0"):
+            if path.lower().endswith(".csv"):
+                files.append(("A", path, path))
     return files
 
 
@@ -249,6 +275,13 @@ def read_csv(data):
         return pd.read_csv(io.BytesIO(data), sep=None, engine="python", encoding="utf-8-sig")
     except Exception:
         return pd.read_csv(io.BytesIO(data), encoding="utf-8-sig")
+
+
+def read_version(rev: str | None, path: str, repo_root: str) -> bytes:
+    """Bytes of a file at a commit, or from disk when rev is None (working tree)."""
+    if rev is None:
+        return (Path(repo_root) / path).read_bytes()
+    return run_git("show", f"{rev}:{path}")
 
 
 def as_plottable(series):
@@ -274,6 +307,7 @@ class App(tk.Tk):
         self.minsize(800, 500)
 
         self.comparison = None
+        self.repo_root = git_text("rev-parse", "--show-toplevel")
         self.files = []
         self.df_before = self.df_after = None
         self.file_name = ""
@@ -281,7 +315,7 @@ class App(tk.Tk):
 
         self._build_controls()
         self._build_plot()
-        self._show_placeholder("Enter a branch name and press Load.")
+        self._show_placeholder("Enter a branch name (or tick 'Use current working tree') and press Load.")
 
     # ------------------------------------------------------------------ layout
     def _build_controls(self):
@@ -298,38 +332,46 @@ class App(tk.Tk):
         row = ttk.Frame(side)
         row.grid(row=1, column=0, sticky="ew", pady=(2, 2))
         self.branch_var = tk.StringVar()
-        entry = ttk.Entry(row, textvariable=self.branch_var)
-        entry.pack(side="left", fill="x", expand=True)
-        entry.bind("<Return>", lambda e: self.load_branch())
-        entry.focus_set()
+        self.branch_entry = ttk.Entry(row, textvariable=self.branch_var)
+        self.branch_entry.pack(side="left", fill="x", expand=True)
+        self.branch_entry.bind("<Return>", lambda e: self.load_branch())
+        self.branch_entry.focus_set()
         self.load_btn = ttk.Button(row, text="Load", command=self.load_branch)
         self.load_btn.pack(side="left", padx=(6, 0))
         ttk.Label(side, text="my-branch = local, origin/my-branch = remote",
                   foreground="gray").grid(row=2, column=0, sticky="w")
 
-        ttk.Label(side, text="Base (before) - optional").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.working_tree_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(side, text="Use current working tree (including uncommitted changes) as 'after'",
+                        variable=self.working_tree_var,
+                        command=self._on_working_tree_toggled).grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        ttk.Label(side, text="Base (before) - optional").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.base_var = tk.StringVar()
         base_entry = ttk.Entry(side, textvariable=self.base_var)
-        base_entry.grid(row=4, column=0, sticky="ew", pady=(2, 2))
+        base_entry.grid(row=5, column=0, sticky="ew", pady=(2, 2))
         base_entry.bind("<Return>", lambda e: self.load_branch())
-        ttk.Label(side, text="empty = the branch it was created from",
-                  foreground="gray").grid(row=5, column=0, sticky="w")
+        ttk.Label(side, text="empty = the branch it was created from (HEAD for the working tree)",
+                  foreground="gray").grid(row=6, column=0, sticky="w")
 
         self.base_label = ttk.Label(side, text="Before (split from): -")
-        self.base_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.base_label.grid(row=7, column=0, sticky="w", pady=(8, 0))
 
         self.status = ttk.Label(side, text="", justify="left")
-        self.status.grid(row=7, column=0, sticky="ew", pady=(10, 10))
+        self.status.grid(row=8, column=0, sticky="ew", pady=(10, 10))
         side.bind("<Configure>", lambda e: self.status.configure(wraplength=max(e.width - 30, 100)))
 
-        self.file_list = self._make_list(side, "Changed CSV files", first_row=8, weight=2)
-        self.x_list = self._make_list(side, "X axis", first_row=10, weight=1)
-        self.y_list = self._make_list(side, "Y axis", first_row=12, weight=1)
+        self.file_list = self._make_list(side, "Changed CSV files", first_row=9, weight=2)
+        self.x_list = self._make_list(side, "X axis", first_row=11, weight=1)
+        self.y_list = self._make_list(side, "Y axis", first_row=13, weight=1)
         self.file_list.bind("<<ListboxSelect>>", self.on_file_selected)
         for lb in (self.x_list, self.y_list):
             lb.bind("<<ListboxSelect>>", lambda e: self.update_plot())
 
         self.list_font = tkfont.Font(font=self.file_list.cget("font"))
+
+    def _on_working_tree_toggled(self):
+        self.branch_entry.configure(state="disabled" if self.working_tree_var.get() else "normal")
 
     def _make_list(self, parent, title, first_row, weight):
         """A labelled listbox with vertical and horizontal scrollbars."""
@@ -383,18 +425,19 @@ class App(tk.Tk):
     def load_branch(self):
         branch = self.branch_var.get().strip()
         base = self.base_var.get().strip()
-        if not branch:
-            self._set_status("Type a branch name first.", error=True)
+        use_working_tree = self.working_tree_var.get()
+        if not branch and not use_working_tree:
+            self._set_status("Type a branch name first, or tick 'Use current working tree'.", error=True)
             return
         self.load_btn.configure(state="disabled")
-        self._set_status(f"Loading '{branch}' (fetching from remote)...")
+        self._set_status("Loading..." if use_working_tree else f"Loading '{branch}' (fetching from remote)...")
         self._reset_file_and_columns()
         self.file_list.delete(0, "end")
         self.base_label.configure(text="Before (split from): -")
 
         def work():  # runs in a background thread so the window stays responsive
             try:
-                comparison = resolve_comparison(branch, base)
+                comparison = resolve_comparison(branch, base, use_working_tree)
                 files = changed_csvs(comparison.base_rev, comparison.head_rev)
                 self.after(0, self._branch_loaded, comparison, files)
             except Exception as exc:  # GitError or anything unexpected
@@ -431,6 +474,13 @@ class App(tk.Tk):
         for lb in (self.x_list, self.y_list):
             lb.delete(0, "end")
 
+    def _read_pair(self, status, old, new):
+        """Return the (before, after) DataFrames of a changed file (None if it does not exist)."""
+        comparison = self.comparison
+        before = None if status == "A" else read_csv(read_version(comparison.base_rev, old, self.repo_root))
+        after = None if status == "D" else read_csv(read_version(comparison.head_rev, new, self.repo_root))
+        return before, after
+
     def on_file_selected(self, _event=None):
         sel = self.file_list.curselection()
         if not sel:
@@ -438,9 +488,7 @@ class App(tk.Tk):
         status, old, new = self.files[sel[0]]
         self._reset_file_and_columns()
         try:
-            comparison = self.comparison
-            self.df_before = read_csv(None if status == "A" else run_git("show", f"{comparison.base_rev}:{old}"))
-            self.df_after = read_csv(None if status == "D" else run_git("show", f"{comparison.head_rev}:{new}"))
+            self.df_before, self.df_after = self._read_pair(status, old, new)
         except Exception as exc:
             self._set_status(f"Could not read {new}:\n{exc}", error=True)
             return
