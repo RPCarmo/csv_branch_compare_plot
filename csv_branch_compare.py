@@ -14,10 +14,12 @@ credentials (SSH keys, credential manager, etc.).
 Then pick a changed CSV file and the X and Y columns. The "before" and "after"
 curves are plotted together; nothing is saved to disk.
 
-"Before" is the file where the branch split off from the branch it was created
-from (its base branch, shown in the window), so the plot shows only the changes
-introduced by the branch. Git doesn't record the base branch, so it is inferred
-from the history: see `find_base`. Only committed changes are compared.
+By default, "before" is the file where the branch split off from the branch it was
+created from (shown in the window), so the plot shows only the changes introduced by
+the branch. Git doesn't record that branch, so it is inferred from the history: see
+`find_base`. Fill in the "Base" field to compare against any other branch, tag or
+commit instead (e.g. my-branch~1 to see only the last commit). Only committed changes
+are compared.
 
 Requires: git on PATH, Python 3.9+, pandas, matplotlib (Tkinter ships with Python)
 """
@@ -28,6 +30,7 @@ import sys
 import textwrap
 import threading
 import warnings
+from dataclasses import dataclass
 
 try:
     import tkinter as tk
@@ -180,6 +183,39 @@ def find_base(head_ref, branch, remote):
     return base_ref, short_ref(base_ref)
 
 
+@dataclass(frozen=True)
+class Comparison:
+    """What is being compared: the 'before' commit and the 'after' side."""
+
+    base_rev: str
+    base_label: str
+    """The branch, tag or commit 'before' comes from, as shown to the user."""
+    base_is_split_point: bool
+    """Whether `base_rev` was inferred as the point where the branch split off."""
+    head_rev: str
+    head_label: str
+
+
+def resolve_comparison(branch: str, base: str) -> Comparison:
+    """
+    Work out 'before' and 'after' from what the user typed in the window.
+
+    An empty `base` means the point where the branch split off the branch it was created
+    from. The branch is resolved (and fetched) first, so a typed remote base is current.
+    """
+    if not branch:
+        raise GitError("Type a branch name.")
+    head_ref, branch_name, remote = resolve_branch(branch)
+    if base:
+        if not ref_exists(base):
+            raise GitError(f"Base '{base}' is not a known branch, tag or commit.")
+        base_rev = git_text("rev-parse", "--verify", f"{base}^{{commit}}")
+        return Comparison(base_rev, base, False, head_ref, branch)
+    base_ref, base_label = find_base(head_ref, branch_name, remote)
+    base_rev = git_text("merge-base", base_ref, head_ref)
+    return Comparison(base_rev, base_label, True, head_ref, branch)
+
+
 def changed_csvs(base_rev, head_rev):
     """Return (status, old_path, new_path) for every CSV changed between two revisions."""
     raw = run_git("diff", "--name-status", "-M", "-z", base_rev, head_rev)
@@ -237,8 +273,7 @@ class App(tk.Tk):
         self.geometry("1150x680")
         self.minsize(800, 500)
 
-        self.branch = self.base = ""
-        self.head_rev = self.base_rev = None
+        self.comparison = None
         self.files = []
         self.df_before = self.df_after = None
         self.file_name = ""
@@ -259,7 +294,7 @@ class App(tk.Tk):
         self.panes.add(side, minsize=300, width=380, stretch="never")
         side.columnconfigure(0, weight=1)
 
-        ttk.Label(side, text="Branch").grid(row=0, column=0, sticky="w")
+        ttk.Label(side, text="Branch (after)").grid(row=0, column=0, sticky="w")
         row = ttk.Frame(side)
         row.grid(row=1, column=0, sticky="ew", pady=(2, 2))
         self.branch_var = tk.StringVar()
@@ -272,16 +307,24 @@ class App(tk.Tk):
         ttk.Label(side, text="my-branch = local, origin/my-branch = remote",
                   foreground="gray").grid(row=2, column=0, sticky="w")
 
-        self.base_label = ttk.Label(side, text="Base branch: -")
-        self.base_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(side, text="Base (before) - optional").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.base_var = tk.StringVar()
+        base_entry = ttk.Entry(side, textvariable=self.base_var)
+        base_entry.grid(row=4, column=0, sticky="ew", pady=(2, 2))
+        base_entry.bind("<Return>", lambda e: self.load_branch())
+        ttk.Label(side, text="empty = the branch it was created from",
+                  foreground="gray").grid(row=5, column=0, sticky="w")
+
+        self.base_label = ttk.Label(side, text="Before (split from): -")
+        self.base_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
 
         self.status = ttk.Label(side, text="", justify="left")
-        self.status.grid(row=4, column=0, sticky="ew", pady=(10, 10))
+        self.status.grid(row=7, column=0, sticky="ew", pady=(10, 10))
         side.bind("<Configure>", lambda e: self.status.configure(wraplength=max(e.width - 30, 100)))
 
-        self.file_list = self._make_list(side, "Changed CSV files", first_row=5, weight=2)
-        self.x_list = self._make_list(side, "X axis", first_row=7, weight=1)
-        self.y_list = self._make_list(side, "Y axis", first_row=9, weight=1)
+        self.file_list = self._make_list(side, "Changed CSV files", first_row=8, weight=2)
+        self.x_list = self._make_list(side, "X axis", first_row=10, weight=1)
+        self.y_list = self._make_list(side, "Y axis", first_row=12, weight=1)
         self.file_list.bind("<<ListboxSelect>>", self.on_file_selected)
         for lb in (self.x_list, self.y_list):
             lb.bind("<<ListboxSelect>>", lambda e: self.update_plot())
@@ -338,47 +381,49 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ actions
     def load_branch(self):
-        name = self.branch_var.get().strip()
-        if not name:
+        branch = self.branch_var.get().strip()
+        base = self.base_var.get().strip()
+        if not branch:
             self._set_status("Type a branch name first.", error=True)
             return
         self.load_btn.configure(state="disabled")
-        self._set_status(f"Loading '{name}' (fetching from remote)...")
+        self._set_status(f"Loading '{branch}' (fetching from remote)...")
         self._reset_file_and_columns()
         self.file_list.delete(0, "end")
-        self.base_label.configure(text="Base branch: -")
+        self.base_label.configure(text="Before (split from): -")
 
         def work():  # runs in a background thread so the window stays responsive
             try:
-                head_rev, branch, remote = resolve_branch(name)
-                base_ref, base = find_base(head_rev, branch, remote)
-                base_rev = git_text("merge-base", base_ref, head_rev)
-                files = changed_csvs(base_rev, head_rev)
-                self.after(0, self._branch_loaded, name, head_rev, base_rev, base, files)
+                comparison = resolve_comparison(branch, base)
+                files = changed_csvs(comparison.base_rev, comparison.head_rev)
+                self.after(0, self._branch_loaded, comparison, files)
             except Exception as exc:  # GitError or anything unexpected
                 self.after(0, self._branch_failed, str(exc))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _branch_loaded(self, name, head_rev, base_rev, base, files):
+    def _branch_loaded(self, comparison, files):
         self.load_btn.configure(state="normal")
-        self.branch, self.head_rev, self.base_rev, self.base, self.files = name, head_rev, base_rev, base, files
-        self.base_label.configure(text=f"Base branch: {base} (merge-base {base_rev[:10]})")
+        self.comparison, self.files = comparison, files
+        sha = comparison.base_rev[:10]
+        commit = f"merge-base {sha}" if comparison.base_is_split_point else sha
+        self.base_label.configure(text=f"Before (split from): {comparison.base_label} ({commit})")
+        description = f"'{comparison.head_label}' vs '{comparison.base_label}'"
         if not files:
-            self._set_status(f"No CSV files changed in '{name}' compared to '{base}'.")
-            self._show_placeholder("No changed CSV files in this branch.")
+            self._set_status(f"No CSV files changed: {description}.")
+            self._show_placeholder("No changed CSV files.")
             return
         labels = [file_label(*f) for f in files]
         for label in labels:
             self.file_list.insert("end", label)
         self._fit_names(labels)
-        self._set_status(f"{len(files)} CSV file(s) changed in '{name}' (vs '{base}').")
+        self._set_status(f"{len(files)} CSV file(s) changed: {description}.")
         self._show_placeholder("Choose a file.")
 
     def _branch_failed(self, message):
         self.load_btn.configure(state="normal")
         self._set_status(message, error=True)
-        self._show_placeholder("Could not load the branch.")
+        self._show_placeholder("Could not load the comparison.")
 
     def _reset_file_and_columns(self):
         self.df_before = self.df_after = None
@@ -393,8 +438,9 @@ class App(tk.Tk):
         status, old, new = self.files[sel[0]]
         self._reset_file_and_columns()
         try:
-            self.df_before = read_csv(None if status == "A" else run_git("show", f"{self.base_rev}:{old}"))
-            self.df_after = read_csv(None if status == "D" else run_git("show", f"{self.head_rev}:{new}"))
+            comparison = self.comparison
+            self.df_before = read_csv(None if status == "A" else run_git("show", f"{comparison.base_rev}:{old}"))
+            self.df_after = read_csv(None if status == "D" else run_git("show", f"{comparison.head_rev}:{new}"))
         except Exception as exc:
             self._set_status(f"Could not read {new}:\n{exc}", error=True)
             return
